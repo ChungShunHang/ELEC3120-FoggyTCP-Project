@@ -26,21 +26,18 @@ Vagrant.configure(2) do |config|
 
   config.ssh.insert_key = false
 
-  config.vm.provider "virtualbox" do |v, override|
-    override.vm.box = "ubuntu/jammy64"
+  config.vm.provider "vmware_desktop" do |v, override|
+    override.vm.box = "bento/debian-11"
   end
 
   config.vm.define :client, primary: true do |host|
     host.vm.hostname = "client"
-    host.vm.network "private_network", ip: "10.0.1.2", netmask: 8,
-        mac: "080027a7feb1", virtualbox__intnet: "3120"
     host.vm.provision "shell", inline: $SET_NETWORK
   end
 
   config.vm.define :server do |host|
     host.vm.hostname = "server"
-    host.vm.network "private_network", ip: "10.0.1.1", netmask: 8,
-        mac: "08002722471c", virtualbox__intnet: "3120"
     host.vm.provision "shell", inline: $SET_NETWORK
   end
 end
+
