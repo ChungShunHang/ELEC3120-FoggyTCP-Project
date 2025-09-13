@@ -83,3 +83,5 @@ int main(int argc, const char* argv[]) {
 
   return 0;
 }
+
+// Checkpoint 1 completed
