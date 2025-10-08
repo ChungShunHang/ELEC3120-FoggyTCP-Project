@@ -101,7 +101,7 @@ void send_pkts(foggy_socket_t *sock, uint8_t *data, int buf_len) {
       slot.is_sent = 0;
       slot.msg = create_packet(
           sock->my_port, ntohs(sock->conn.sin_port),
-          sock->window.last_byte_sent, sock->window.next_seq_expected,
+          sock->window.last_byte_sent, 0,
           sizeof(foggy_tcp_header_t), sizeof(foggy_tcp_header_t) + payload_len,
           ACK_FLAG_MASK,
           MAX(MAX_NETWORK_BUFFER - (uint32_t)sock->received_len, MSS), 0, NULL,
@@ -163,17 +163,17 @@ void transmit_send_window(foggy_socket_t *sock) {
   // If it has been sent but not ACKed, skip.
   send_window_slot_t& slot = sock->send_window.front();
   foggy_tcp_header_t *hdr = (foggy_tcp_header_t *)slot.msg;
-  if (slot.is_sent){
-    return;
-  } else {
-    debug_printf("Sending packet %d %d\n", get_seq(hdr),
-                   get_seq(hdr) + get_payload_len(slot.msg));
-    slot.is_sent = 1;
-    sendto(sock->socket, slot.msg, get_plen(hdr), 0,
-            (struct sockaddr *)&(sock->conn), sizeof(sock->conn));
+  for (auto& slot : sock->send_window) {
+    foggy_tcp_header_t *hdr = (foggy_tcp_header_t *)slot.msg;
+    if (!slot.is_sent) {
+      debug_printf("Sending packet %d %d\n", get_seq(hdr),
+                     get_seq(hdr) + get_payload_len(slot.msg));
+      slot.is_sent = 1;
+      sendto(sock->socket, slot.msg, get_plen(hdr), 0,
+              (struct sockaddr *)&(sock->conn), sizeof(sock->conn));
+    }
   }
 }
-
 void receive_send_window(foggy_socket_t *sock) {
   // Pop out the packets that have been ACKed
   while (1) {
