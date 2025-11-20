@@ -41,3 +41,5 @@ void process_receive_window(foggy_socket_t *sock);
 void transmit_send_window(foggy_socket_t *sock);
 
 void receive_send_window(foggy_socket_t *sock);
+
+//

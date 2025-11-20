@@ -193,3 +193,5 @@ int foggy_write(void *sock, const void *buf, int length);
  */
 
 #endif // FOGGY_TCP_H_
+
+//

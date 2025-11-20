@@ -332,3 +332,5 @@ int foggy_write(void *in_sock, const void *buf, int length)
     pthread_mutex_unlock(&(sock->send_lock));
     return EXIT_SUCCESS;
 }
+
+//
