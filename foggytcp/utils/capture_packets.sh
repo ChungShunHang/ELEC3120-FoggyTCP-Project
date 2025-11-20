@@ -11,7 +11,7 @@
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 HOST=$(hostname)
-IFNAME=$(ip addr show | grep -B1 172.16.59.130 | grep -o "eth[0-9]")
+IFNAME="eth0" #$(ip addr show | grep -B1 172.16.59.130 | grep -o "eth[0-9]")
 FUNCTION_TO_RUN=$1
 PCAP_NAME=$2
 
