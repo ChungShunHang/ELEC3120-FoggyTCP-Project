@@ -60,6 +60,96 @@ static void fast_retransmit(foggy_socket_t *sock)
     pthread_mutex_unlock(&(sock->swnd_lock));
 }
 
+static inline void areno_update_rtt(foggy_socket_t *sock)
+{
+    // Collect RTT samples for sent RTT-marked packets now ACKed.
+    while (pthread_mutex_lock(&(sock->swnd_lock)) != 0) {}
+    uint64_t now = now_ms();
+    for (auto &slot : sock->send_window)
+    {
+        if (!slot.is_rtt_sample) continue;
+        if (!slot.is_sent) continue;
+        foggy_tcp_header_t *hdr = (foggy_tcp_header_t *)slot.msg;
+        if (!has_been_acked(sock, get_seq(hdr))) continue;
+
+        uint64_t sample = now - slot.last_sent_ms;
+        slot.is_rtt_sample = 0;
+
+        // Initialize base RTT
+        if (sock->window.base_rtt_ms == 0 || sample < sock->window.base_rtt_ms)
+            sock->window.base_rtt_ms = sample;
+
+        // EWMA (alpha=0.2)
+        if (sock->window.avg_rtt_ms == 0)
+            sock->window.avg_rtt_ms = sample;
+        else
+            sock->window.avg_rtt_ms = (uint64_t)(0.8 * sock->window.avg_rtt_ms + 0.2 * sample);
+
+        sock->window.last_rtt_ms = sample;
+        sock->window.rtt_samples++;
+    }
+    pthread_mutex_unlock(&(sock->swnd_lock));
+}
+
+static inline void areno_maybe_lift_ssthresh(foggy_socket_t *sock)
+{
+    // After 4 RTT samples with low queuing (<10% inflation), lift ssthresh modestly.
+    if (sock->window.rtt_samples < 4) return;
+    if (sock->window.base_rtt_ms == 0) return;
+
+    double infl = (double)sock->window.avg_rtt_ms / (double)sock->window.base_rtt_ms;
+    if (infl <= 1.10)
+    {
+        sock->window.ssthresh += 8 * MSS; // allow larger slow-start boundary
+        sock->window.rtt_samples = 0;     // reset epoch sample counter
+    }
+}
+
+static inline void areno_congestion_avoid_increase(foggy_socket_t *sock, uint32_t newly_acked_bytes)
+{
+    if (sock->window.base_rtt_ms == 0) {
+        // No RTT context yet: fall back to Reno additive increase.
+        uint32_t inc = (MSS * newly_acked_bytes) / MAX(sock->window.congestion_window, (uint32_t)1);
+        if (inc == 0 && newly_acked_bytes > 0) inc = 1;
+        sock->window.congestion_window += inc;
+        return;
+    }
+
+    double infl = (double)sock->window.last_rtt_ms / (double)sock->window.base_rtt_ms;
+
+    // Modes:
+    // Underutilized (infl <=1.10): aggressive (≈2 MSS per RTT)
+    // Normal (1.10 < infl <=1.25): Reno (≈1 MSS per RTT)
+    // Approaching congestion (infl >1.25): conservative (≈0.5 MSS per RTT)
+    double target_factor;
+    if (infl <= 1.10)       target_factor = 2.0;
+    else if (infl <= 1.25)  target_factor = 1.0;
+    else                    target_factor = 0.5;
+
+    // Per ACK increment ≈ target_factor * MSS^2 / cwnd * (newly_acked_bytes / MSS)
+    uint64_t cwnd = sock->window.congestion_window;
+    uint64_t bytes = newly_acked_bytes;
+    if (cwnd == 0) cwnd = MSS;
+
+    uint64_t scaled = (uint64_t)(target_factor * (double)MSS * (double)bytes);
+    uint32_t inc = (uint32_t)(scaled / cwnd);
+
+    if (inc == 0 && bytes > 0) inc = 1;
+    sock->window.congestion_window += inc;
+}
+
+static inline void areno_on_loss(foggy_socket_t *sock)
+{
+    // Gentler multiplicative decrease (retain more throughput).
+    uint32_t cwnd = sock->window.congestion_window;
+    uint32_t new_ssthresh = (uint32_t)(cwnd * 0.7); // vs 0.5 in Reno
+    if (new_ssthresh < MSS) new_ssthresh = MSS;
+    sock->window.ssthresh = new_ssthresh;
+    sock->window.congestion_window = sock->window.ssthresh + 3 * MSS;
+    sock->window.reno_state = RENO_FAST_RECOVERY;
+    sock->window.epoch_start_ms = now_ms();
+}
+
 /**
  * Updates the socket information to represent the newly received packet.
  *
