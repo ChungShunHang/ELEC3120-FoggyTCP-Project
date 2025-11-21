@@ -42,4 +42,6 @@ void transmit_send_window(foggy_socket_t *sock);
 
 void receive_send_window(foggy_socket_t *sock);
 
-//
+// New CUBIC helpers
+void cubic_update_on_ack(foggy_socket_t *sock, uint32_t newly_acked);
+void cubic_on_loss(foggy_socket_t *sock);

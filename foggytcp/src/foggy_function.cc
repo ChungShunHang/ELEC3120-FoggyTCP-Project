@@ -12,6 +12,7 @@ from releasing their forks in any public places. */
 #include <cstring>
 #include <cstdio>
 #include <time.h>
+#include <math.h>  // New: for cbrt in CUBIC
 
 #include "foggy_function.h"
 #include "foggy_backend.h"
@@ -53,101 +54,79 @@ static void fast_retransmit(foggy_socket_t *sock)
         sendto(sock->socket, slot.msg, plen, 0,
                (struct sockaddr *)&(sock->conn), sizeof(sock->conn));
         slot.last_sent_ms = now_ms();
-        /* retransmission: don't use this as an RTT sample */
-        slot.is_rtt_sample = 0;
         break;
     }
     pthread_mutex_unlock(&(sock->swnd_lock));
 }
 
-static inline void areno_update_rtt(foggy_socket_t *sock)
+// New: CUBIC loss handler (multiplicative decrease)
+void cubic_on_loss(foggy_socket_t *sock)
 {
-    // Collect RTT samples for sent RTT-marked packets now ACKed.
-    while (pthread_mutex_lock(&(sock->swnd_lock)) != 0) {}
+    // Assumes ack_lock is held by caller when called on loss path
+    // Save current cwnd as Wmax (classic cubic uses fast convergence tweaks; keep simple)
+    sock->window.cubic_w_max = sock->window.congestion_window;
+
+    // Multiplicative decrease
+    uint32_t reduced = (uint32_t)(sock->window.congestion_window * sock->window.cubic_beta);
+    if (reduced < MSS) reduced = MSS;
+
+    sock->window.ssthresh = reduced;
+    sock->window.congestion_window = reduced;
+
+    // Reset epoch so we recompute the cubic curve after loss
+    sock->window.cubic_epoch_start_ms = 0;
+    sock->window.cubic_origin_point = sock->window.congestion_window;
+}
+
+// New: CUBIC growth on ACK during Congestion Avoidance
+void cubic_update_on_ack(foggy_socket_t *sock, uint32_t newly_acked)
+{
+    // Assumes ack_lock is held by caller
     uint64_t now = now_ms();
-    for (auto &slot : sock->send_window)
-    {
-        if (!slot.is_rtt_sample) continue;
-        if (!slot.is_sent) continue;
-        foggy_tcp_header_t *hdr = (foggy_tcp_header_t *)slot.msg;
-        if (!has_been_acked(sock, get_seq(hdr))) continue;
 
-        uint64_t sample = now - slot.last_sent_ms;
-        slot.is_rtt_sample = 0;
-
-        // Initialize base RTT
-        if (sock->window.base_rtt_ms == 0 || sample < sock->window.base_rtt_ms)
-            sock->window.base_rtt_ms = sample;
-
-        // EWMA (alpha=0.2)
-        if (sock->window.avg_rtt_ms == 0)
-            sock->window.avg_rtt_ms = sample;
-        else
-            sock->window.avg_rtt_ms = (uint64_t)(0.8 * sock->window.avg_rtt_ms + 0.2 * sample);
-
-        sock->window.last_rtt_ms = sample;
-        sock->window.rtt_samples++;
+    if (sock->window.cubic_epoch_start_ms == 0) {
+        sock->window.cubic_epoch_start_ms = now;
+        // Use current cwnd as new origin
+        sock->window.cubic_origin_point = sock->window.congestion_window;
+        // Ensure Wmax is at least current cwnd
+        if (sock->window.cubic_w_max < sock->window.congestion_window)
+            sock->window.cubic_w_max = sock->window.congestion_window;
     }
-    pthread_mutex_unlock(&(sock->swnd_lock));
-}
 
-static inline void areno_maybe_lift_ssthresh(foggy_socket_t *sock)
-{
-    // After 4 RTT samples with low queuing (<10% inflation), lift ssthresh modestly.
-    if (sock->window.rtt_samples < 4) return;
-    if (sock->window.base_rtt_ms == 0) return;
+    double t = (double)(now - sock->window.cubic_epoch_start_ms) / 1000.0; // seconds
+    double C = sock->window.cubic_C;
+    double Wmax = (double)sock->window.cubic_w_max;
+    double W0   = (double)sock->window.cubic_origin_point;
 
-    double infl = (double)sock->window.avg_rtt_ms / (double)sock->window.base_rtt_ms;
-    if (infl <= 1.10)
-    {
-        sock->window.ssthresh += 8 * MSS; // allow larger slow-start boundary
-        sock->window.rtt_samples = 0;     // reset epoch sample counter
+    // K = cbrt((Wmax - W0)/C)  [units: seconds]
+    double K = 0.0;
+    if (Wmax > W0 && C > 0.0) {
+        double ratio = (Wmax - W0) / C;
+        if (ratio > 0.0) K = cbrt(ratio);
     }
-}
 
-static inline void areno_congestion_avoid_increase(foggy_socket_t *sock, uint32_t newly_acked_bytes)
-{
-    if (sock->window.base_rtt_ms == 0) {
-        // No RTT context yet: fall back to Reno additive increase.
-        uint32_t inc = (MSS * newly_acked_bytes) / MAX(sock->window.congestion_window, (uint32_t)1);
-        if (inc == 0 && newly_acked_bytes > 0) inc = 1;
+    // W_cubic(t) = C*(t - K)^3 + Wmax
+    double diff = (t - K);
+    double Wt = C * diff * diff * diff + Wmax;
+    if (Wt < (double)MSS) Wt = (double)MSS;
+
+    double cwndD = (double)sock->window.congestion_window;
+
+    if (Wt > cwndD) {
+        // Move cwnd toward cubic target, cap per-ACK growth by MSS for stability
+        double delta = Wt - cwndD;
+        uint32_t inc = (uint32_t)MIN((double)MSS, delta);
+        if (inc == 0 && newly_acked > 0) inc = 1;
         sock->window.congestion_window += inc;
-        return;
+    } else {
+        // TCP-friendly region: fall back to a Reno-like byte counting increase
+        if (sock->window.congestion_window > 0) {
+            uint32_t inc = (uint32_t)((double)MSS * (double)newly_acked /
+                                      (double)MAX(sock->window.congestion_window, (uint32_t)1));
+            if (inc == 0 && newly_acked > 0) inc = 1;
+            sock->window.congestion_window += inc;
+        }
     }
-
-    double infl = (double)sock->window.last_rtt_ms / (double)sock->window.base_rtt_ms;
-
-    // Modes:
-    // Underutilized (infl <=1.10): aggressive (≈2 MSS per RTT)
-    // Normal (1.10 < infl <=1.25): Reno (≈1 MSS per RTT)
-    // Approaching congestion (infl >1.25): conservative (≈0.5 MSS per RTT)
-    double target_factor;
-    if (infl <= 1.10)       target_factor = 2.0;
-    else if (infl <= 1.25)  target_factor = 1.0;
-    else                    target_factor = 0.5;
-
-    // Per ACK increment ≈ target_factor * MSS^2 / cwnd * (newly_acked_bytes / MSS)
-    uint64_t cwnd = sock->window.congestion_window;
-    uint64_t bytes = newly_acked_bytes;
-    if (cwnd == 0) cwnd = MSS;
-
-    uint64_t scaled = (uint64_t)(target_factor * (double)MSS * (double)bytes);
-    uint32_t inc = (uint32_t)(scaled / cwnd);
-
-    if (inc == 0 && bytes > 0) inc = 1;
-    sock->window.congestion_window += inc;
-}
-
-static inline void areno_on_loss(foggy_socket_t *sock)
-{
-    // Gentler multiplicative decrease (retain more throughput).
-    uint32_t cwnd = sock->window.congestion_window;
-    uint32_t new_ssthresh = (uint32_t)(cwnd * 0.7); // vs 0.5 in Reno
-    if (new_ssthresh < MSS) new_ssthresh = MSS;
-    sock->window.ssthresh = new_ssthresh;
-    sock->window.congestion_window = sock->window.ssthresh + 3 * MSS;
-    sock->window.reno_state = RENO_FAST_RECOVERY;
-    sock->window.epoch_start_ms = now_ms();
 }
 
 /**
@@ -205,71 +184,37 @@ void on_recv_pkt(foggy_socket_t *sock, uint8_t *pkt)
         {
             uint32_t newly_acked = ack - sock->window.last_ack_received;
 
-            /* RTT measurement: update srtt/rttvar/rto when an RTT-sampled packet is ACKed */
-            while (pthread_mutex_lock(&(sock->swnd_lock)) != 0)
-            {
-            }
-            for (auto &slot : sock->send_window)
-            {
-                if (!slot.is_sent)
-                    continue;
-                foggy_tcp_header_t *s_hdr = (foggy_tcp_header_t *)slot.msg;
-                uint32_t seq = get_seq(s_hdr);
-                if (slot.is_rtt_sample && after(ack, seq))
-                {
-                    uint64_t now = now_ms();
-                    uint32_t measured_rtt = (uint32_t)(now - slot.last_sent_ms);
-                    if (measured_rtt == 0)
-                        measured_rtt = 1;
-                    if (sock->window.srtt_ms == 0)
-                    {
-                        sock->window.srtt_ms = measured_rtt;
-                        sock->window.rttvar_ms = measured_rtt / 2;
-                    }
-                    else
-                    {
-                        int32_t delta = (int32_t)measured_rtt - (int32_t)sock->window.srtt_ms;
-                        sock->window.srtt_ms += delta / 8; /* alpha=1/8 */
-                        if (delta < 0)
-                            delta = -delta;
-                        sock->window.rttvar_ms += (delta - (int32_t)sock->window.rttvar_ms) / 4; /* beta=1/4 */
-                    }
-                    uint32_t new_rto = sock->window.srtt_ms + 4 * sock->window.rttvar_ms;
-                    if (new_rto < 100)
-                        new_rto = 100;
-                    if (new_rto > 60000)
-                        new_rto = 60000;
-                    sock->window.rto_ms = new_rto;
-                    slot.is_rtt_sample = 0;
-                    break;
-                }
-            }
-            pthread_mutex_unlock(&(sock->swnd_lock));
-
             if (sock->window.reno_state == RENO_FAST_RECOVERY)
             {
+                // Recovery complete -> CA
                 sock->window.congestion_window = sock->window.ssthresh;
                 sock->window.reno_state = RENO_CONGESTION_AVOIDANCE;
+                // Reset CUBIC epoch on recovery exit so growth follows new curve
+                if (sock->window.cca_alg == CCA_CUBIC) {
+                    sock->window.cubic_epoch_start_ms = 0;
+                    sock->window.cubic_origin_point = sock->window.congestion_window;
+                }
             }
             else if (sock->window.reno_state == RENO_SLOW_START)
             {
-                // Classic slow start: cwnd += MSS per ACK that advances ACK
-                sock->window.congestion_window += MSS;
+                // Slow start: byte counting
+                sock->window.congestion_window += newly_acked;
                 if (sock->window.congestion_window >= sock->window.ssthresh)
-                {
                     sock->window.reno_state = RENO_CONGESTION_AVOIDANCE;
-                }
             }
             else if (sock->window.reno_state == RENO_CONGESTION_AVOIDANCE)
             {
-                // AIMD per byte (approx): cwnd += MSS * bytes_acked / cwnd
-                if (sock->window.congestion_window > 0)
-                {
-                    uint32_t inc = (MSS * newly_acked) /
-                                   MAX(sock->window.congestion_window, (uint32_t)1);
-                    if (inc == 0 && newly_acked > 0)
-                        inc = 1;
-                    sock->window.congestion_window += inc;
+                if (sock->window.cca_alg == CCA_CUBIC) {
+                    cubic_update_on_ack(sock, newly_acked);
+                } else {
+                    // Reno AIMD
+                    if (sock->window.congestion_window > 0)
+                    {
+                        uint32_t inc = (MSS * newly_acked) /
+                                       MAX(sock->window.congestion_window, (uint32_t)1);
+                        if (inc == 0 && newly_acked > 0) inc = 1;
+                        sock->window.congestion_window += inc;
+                    }
                 }
             }
 
@@ -291,10 +236,16 @@ void on_recv_pkt(foggy_socket_t *sock, uint8_t *pkt)
                 sock->window.dup_ack_count == 3)
             {
                 // Enter Fast Recovery
-                sock->window.ssthresh = MAX(sock->window.congestion_window / 2, MSS);
-                sock->window.congestion_window = sock->window.ssthresh + 3 * MSS;
-                sock->window.reno_state = RENO_FAST_RECOVERY;
-
+                if (sock->window.cca_alg == CCA_CUBIC) {
+                    // Apply CUBIC multiplicative decrease only; do NOT reinflate to ssthresh+3*MSS
+                    cubic_on_loss(sock);
+                    sock->window.reno_state = RENO_FAST_RECOVERY;
+                    // Keep cwnd at reduced value (sock->window.congestion_window already set)
+                } else {
+                    sock->window.ssthresh = MAX(sock->window.congestion_window / 2, MSS);
+                    sock->window.congestion_window = sock->window.ssthresh + 3 * MSS;
+                    sock->window.reno_state = RENO_FAST_RECOVERY;
+                }
                 pthread_mutex_unlock(&(sock->window.ack_lock));
                 fast_retransmit(sock);
                 pthread_mutex_lock(&(sock->window.ack_lock));
@@ -302,7 +253,7 @@ void on_recv_pkt(foggy_socket_t *sock, uint8_t *pkt)
             else if (sock->window.reno_state == RENO_FAST_RECOVERY &&
                      sock->window.dup_ack_count > 3)
             {
-                // Inflate CWND by 1 MSS per extra dup-ACK
+                // Limited transmit / inflation while in FR
                 sock->window.congestion_window += MSS;
             }
         }
@@ -485,38 +436,6 @@ void transmit_send_window(foggy_socket_t *sock)
             break;
         }
 
-        /* Timeout detection: scan for earliest outstanding and retransmit if timed out */
-        uint64_t now = now_ms();
-        for (auto &slot : sock->send_window)
-        {
-            if (!slot.is_sent)
-                continue;
-            foggy_tcp_header_t *hdr = (foggy_tcp_header_t *)slot.msg;
-            if (has_been_acked(sock, get_seq(hdr)))
-                continue;
-            if (slot.last_sent_ms == 0)
-                continue;
-            uint32_t elapsed = (uint32_t)(now - slot.last_sent_ms);
-            if (elapsed >= sock->window.rto_ms)
-            {
-                /* Timeout: retransmit this packet and apply backoff */
-                printf("Timeout: retransmit seq %u (elapsed %u ms, rto %u ms)\n", get_seq(hdr), elapsed, sock->window.rto_ms);
-                sendto(sock->socket, slot.msg, get_plen(hdr), 0,
-                       (struct sockaddr *)&(sock->conn), sizeof(sock->conn));
-                slot.last_sent_ms = now;
-                slot.is_rtt_sample = 0; /* retransmission shouldn't be used for RTT */
-                /* Exponential backoff on RTO */
-                sock->window.rto_ms = MIN(sock->window.rto_ms * 2, (uint32_t)60000);
-                /* Multiplicative decrease of congestion window */
-                pthread_mutex_lock(&(sock->window.ack_lock));
-                sock->window.ssthresh = MAX(sock->window.congestion_window / 2, (uint32_t)MSS);
-                sock->window.congestion_window = MSS;
-                sock->window.reno_state = RENO_SLOW_START;
-                pthread_mutex_unlock(&(sock->window.ack_lock));
-                break; /* handle one timeout per call to avoid aggressive loops */
-            }
-        }
-
         bool sent_one = false;
         for (auto &slot : sock->send_window)
         {
@@ -530,7 +449,7 @@ void transmit_send_window(foggy_socket_t *sock)
             if (payload_len == 0)
             {
                 slot.is_sent = 1;
-                slot.timeout_interval = sock->window.rto_ms;
+                slot.timeout_interval = WINDOW_INITIAL_RTT;
                 slot.last_sent_ms = now_ms();
                 sendto(sock->socket, slot.msg, get_plen(hdr), 0,
                        (struct sockaddr *)&(sock->conn), sizeof(sock->conn));
@@ -544,21 +463,7 @@ void transmit_send_window(foggy_socket_t *sock)
             debug_printf("Sending packet %d %d\n", get_seq(hdr),
                          get_seq(hdr) + payload_len);
             slot.is_sent = 1;
-            /* mark an RTT sample only if no other sample is outstanding */
-            bool sample_exists = false;
-            for (auto &s2 : sock->send_window)
-            {
-                if (&s2 == &slot)
-                    break;
-                if (s2.is_sent && s2.is_rtt_sample)
-                {
-                    sample_exists = true;
-                    break;
-                }
-            }
-            if (!sample_exists)
-                slot.is_rtt_sample = 1;
-            slot.timeout_interval = sock->window.rto_ms;
+            slot.timeout_interval = WINDOW_INITIAL_RTT;
             slot.last_sent_ms = now_ms();
             sendto(sock->socket, slot.msg, get_plen(hdr), 0,
                    (struct sockaddr *)&(sock->conn), sizeof(sock->conn));
@@ -599,5 +504,3 @@ void receive_send_window(foggy_socket_t *sock)
 
     transmit_send_window(sock);
 }
-
-//

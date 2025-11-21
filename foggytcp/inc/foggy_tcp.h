@@ -1,3 +1,4 @@
+
 /* Copyright (C) 2024 Hong Kong University of Science and Technology
 
 This repository is used for the Computer Networks (ELEC 3120)
@@ -40,6 +41,13 @@ typedef enum
     RENO_FAST_RECOVERY = 2,
 } reno_state_t;
 
+// New: Congestion Control Algorithm selector
+typedef enum
+{
+    CCA_RENO = 0,
+    CCA_CUBIC = 1,
+} cca_alg_t;
+
 #define RECEIVE_WINDOW_SLOT_SIZE 64
 
 typedef struct
@@ -80,10 +88,16 @@ typedef struct
 
     reno_state_t reno_state;
     pthread_mutex_t ack_lock;
-    /* RTT/RTO estimation (ms) */
-    uint32_t srtt_ms;     // smoothed RTT
-    uint32_t rttvar_ms;   // RTT variation
-    uint32_t rto_ms;      // retransmission timeout
+
+    // New: CCA mode and CUBIC state
+    cca_alg_t cca_alg;
+
+    // CUBIC parameters/state
+    uint64_t cubic_epoch_start_ms;   // epoch start in ms
+    uint32_t cubic_w_max;            // last cwnd before loss (bytes)
+    uint32_t cubic_origin_point;     // origin point for cubic (bytes)
+    double   cubic_C;                // cubic scaling constant (default ~0.4)
+    double   cubic_beta;             // multiplicative decrease (default ~0.7)
 } window_t;
 
 /**
@@ -193,5 +207,3 @@ int foggy_write(void *sock, const void *buf, int length);
  */
 
 #endif // FOGGY_TCP_H_
-
-//

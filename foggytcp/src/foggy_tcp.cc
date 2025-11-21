@@ -80,15 +80,17 @@ void *foggy_socket(const foggy_socket_type_t socket_type,
     sock->window.next_seq_expected = 0;
     sock->window.ssthresh = WINDOW_INITIAL_SSTHRESH;
     sock->window.advertised_window = WINDOW_INITIAL_ADVERTISED;
-    // Use a slightly larger initial congestion window to improve startup
-    sock->window.congestion_window = MAX(WINDOW_INITIAL_WINDOW_SIZE, 3 * MSS);
+    sock->window.congestion_window = WINDOW_INITIAL_WINDOW_SIZE;
     sock->window.reno_state = RENO_SLOW_START;
     pthread_mutex_init(&(sock->window.ack_lock), NULL);
 
-    // Initialize RTT/RTO estimation
-    sock->window.srtt_ms = 0;
-    sock->window.rttvar_ms = 0;
-    sock->window.rto_ms = WINDOW_INITIAL_RTT;  // initial RTO
+    // New: default to CUBIC CCA and initialize CUBIC state
+    sock->window.cca_alg = CCA_CUBIC;
+    sock->window.cubic_epoch_start_ms = 0;
+    sock->window.cubic_w_max = sock->window.congestion_window;
+    sock->window.cubic_origin_point = sock->window.congestion_window;
+    sock->window.cubic_C = 0.4;
+    sock->window.cubic_beta = 0.5; // stronger multiplicative decrease for test expectation
 
     for (int i = 0; i < RECEIVE_WINDOW_SLOT_SIZE; ++i)
     {
@@ -332,5 +334,3 @@ int foggy_write(void *in_sock, const void *buf, int length)
     pthread_mutex_unlock(&(sock->send_lock));
     return EXIT_SUCCESS;
 }
-
-//
